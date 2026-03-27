@@ -19,6 +19,9 @@ import requests
 API_KEY = "y0axaPDDB3bSmyfPBpLg45tj4ZJdMjgW"
 OPENAI_MODEL_DEFAULT = "gpt-4.1-mini"
 
+# Annual EPS, yearly average price (historical P/E), price history API range — max year; TTM uses last 4 quarters separately.
+MAX_HISTORICAL_YEAR = 2025
+
 app = FastAPI()
 
 # Allow the simple static chat UI to call this API from a browser.
@@ -328,15 +331,18 @@ def _build_price_data(historical_prices):
     for item in historical_prices:
         try:
             year = item["date"][:4]
+            if int(year) > MAX_HISTORICAL_YEAR:
+                continue
             price = float(item["close"])
             yearly_prices.setdefault(year, []).append(price)
         except Exception:
             continue
 
+    y_max = str(MAX_HISTORICAL_YEAR)
     return {
         year: float(np.mean(prices))
         for year, prices in yearly_prices.items()
-        if "2017" <= year <= "2025"
+        if "2017" <= year <= y_max
     }
 
 
@@ -364,7 +370,8 @@ def data_agent(symbol):
     balance_latest_url = f"https://financialmodelingprep.com/api/v3/balance-sheet-statement/{symbol}?limit=1&apikey={API_KEY}"
     cash_latest_url = f"https://financialmodelingprep.com/api/v3/cash-flow-statement/{symbol}?limit=1&apikey={API_KEY}"
     dividends_url = f"https://financialmodelingprep.com/api/v3/historical-price-full/stock_dividend/{symbol}?apikey={API_KEY}"
-    price_history_url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?serietype=line&from=2017-01-01&to=2025-12-31&apikey={API_KEY}"
+    to_date = f"{MAX_HISTORICAL_YEAR}-12-31"
+    price_history_url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?serietype=line&from=2017-01-01&to={to_date}&apikey={API_KEY}"
     income_quarter_url = f"https://financialmodelingprep.com/api/v3/income-statement/{symbol}?period=quarter&limit=4&apikey={API_KEY}"
 
     profile_payload = _fetch_json(profile_url, timeout=20, default=[])
@@ -438,12 +445,12 @@ def fetch_dividend_yield(raw_data, price):
     for entry in divs:
         try:
             year = int(entry["date"][:4])
-            if 2020 <= year <= 2025:
+            if 2020 <= year <= MAX_HISTORICAL_YEAR:
                 div_by_year[year] = div_by_year.get(year, 0.0) + float(entry["dividend"])
         except Exception:
             continue
 
-    annual_24 = div_by_year.get(2025, 0.0)
+    annual_24 = div_by_year.get(MAX_HISTORICAL_YEAR, 0.0)
     return (annual_24 / price) * 100 if price else 0.0
 
 
@@ -458,6 +465,8 @@ def calculate_annualized_return(raw_data, current_price):
             try:
                 if "date" in item and "eps" in item:
                     y = int(item["date"][:4])
+                    if y > MAX_HISTORICAL_YEAR:
+                        continue
                     eps_val = float(item["eps"])
                     eps_pairs.append((y, eps_val))
             except Exception:
@@ -517,6 +526,8 @@ def _extract_eps_pairs(eps_data):
     for item in eps_data:
         try:
             y = int(item["date"][:4])
+            if y > MAX_HISTORICAL_YEAR:
+                continue
             eps_val = float(item["eps"])
             eps_pairs.append((y, eps_val))
         except Exception:
@@ -644,13 +655,13 @@ def build_plot_data(raw_data):
         try:
             year = int(str(item.get("date", ""))[:4])
             eps = float(item.get("eps"))
-            if 2017 <= year <= 2025:
+            if 2017 <= year <= MAX_HISTORICAL_YEAR:
                 eps_by_year[year] = eps
         except Exception:
             continue
 
     valid_points = []
-    for year in range(2017, 2026):
+    for year in range(2017, MAX_HISTORICAL_YEAR + 1):
         avg_price = price_data.get(str(year))
         eps = eps_by_year.get(year)
         if avg_price is None or eps is None or eps <= 0:

@@ -18,13 +18,35 @@ INTRO = (
 )
 
 
-def get_api_base() -> str:
+def _default_api_base() -> str:
     try:
         if "ENVY_API_URL" in st.secrets:
             return str(st.secrets["ENVY_API_URL"]).strip().rstrip("/")
     except Exception:
         pass
     return os.environ.get("ENVY_API_URL", "http://127.0.0.1:8000").strip().rstrip("/")
+
+
+def likely_streamlit_cloud() -> bool:
+    """Heuristic: hosted Streamlit cannot reach your laptop's localhost."""
+    env = os.environ
+    return bool(
+        env.get("STREAMLIT_SERVER_HEADLESS")
+        or env.get("STREAMLIT_SHARING_MODE")
+        or env.get("STREAMLIT_CLOUD")
+        or (env.get("HOSTNAME", "").lower().find("streamlit") >= 0)
+    )
+
+
+def get_api_base() -> str:
+    """Session override (UI) > secrets > env > localhost."""
+    try:
+        ov = (st.session_state.get("api_base_override") or "").strip()
+        if ov:
+            return ov.rstrip("/")
+    except Exception:
+        pass
+    return _default_api_base()
 
 
 def post_query(api_base: str, query: str, session_id: str, timeout: int = 120) -> str:
@@ -154,11 +176,44 @@ def main() -> None:
         st.session_state.messages = [{"role": "assistant", "content": INTRO}]
     if "pending_query" not in st.session_state:
         st.session_state.pending_query = None
+    if "api_base_override" not in st.session_state:
+        st.session_state.api_base_override = ""
 
     api_base = get_api_base()
 
     st.markdown("### Finance Agent")
     st.caption("Ask about stocks, valuations, and news")
+
+    if likely_streamlit_cloud() and ("127.0.0.1" in api_base or "localhost" in api_base.lower()):
+        st.error(
+            "**This app is hosted on Streamlit Cloud** — it cannot reach `localhost` on your computer. "
+            "Deploy FastAPI (e.g. Render), then either: set **`ENVY_API_URL`** in "
+            "**App settings → Secrets**, or paste your public API URL below."
+        )
+
+    with st.expander("API connection (use if chat fails)", expanded=False):
+        st.markdown(
+            f"**Currently calling:** `{api_base}`\n\n"
+            "• **Local:** run `uvicorn main:app --host 127.0.0.1 --port 8000` — default `http://127.0.0.1:8000` is fine.\n\n"
+            "• **Streamlit Cloud:** set **`ENVY_API_URL`** in Secrets, *or* paste your public **`https://…`** API below and click **Apply**."
+        )
+        st.text_input(
+            "Override API base URL (this session only)",
+            placeholder="https://your-api.onrender.com",
+            key="api_url_input_field",
+        )
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("Apply URL", use_container_width=True):
+                raw = (st.session_state.get("api_url_input_field") or "").strip().rstrip("/")
+                st.session_state.api_base_override = raw
+                st.rerun()
+        with b2:
+            if st.button("Clear override", use_container_width=True):
+                st.session_state.api_base_override = ""
+                if "api_url_input_field" in st.session_state:
+                    del st.session_state.api_url_input_field
+                st.rerun()
 
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
