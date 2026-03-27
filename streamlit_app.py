@@ -40,6 +40,23 @@ def post_query(api_base: str, query: str, session_id: str, timeout: int = 120) -
     return text if isinstance(text, str) and text.strip() else "(No response)"
 
 
+def format_api_error(exc: Exception, api_base: str) -> str:
+    """Human hint when API is unreachable (esp. localhost on Streamlit Cloud)."""
+    base = (api_base or "").lower()
+    detail = str(exc)
+    hint = ""
+    if "127.0.0.1" in base or "localhost" in base:
+        hint = (
+            "\n\n---\n"
+            "**Hosted app (Streamlit Cloud):** `localhost` points at the cloud server, not your laptop. "
+            "Deploy your FastAPI app (e.g. Render), then in **Streamlit → App settings → Secrets** add:\n"
+            "`ENVY_API_URL = \"https://your-api.onrender.com\"` (no trailing slash).\n\n"
+            "**On your Mac:** run `uvicorn main:app --host 127.0.0.1 --port 8000` and use Streamlit locally, "
+            "or set `ENVY_API_URL` to wherever the API runs."
+        )
+    return f"**Request failed:** {detail}{hint}"
+
+
 def inject_styles() -> None:
     st.markdown(
         """
@@ -155,7 +172,7 @@ def main() -> None:
             with st.spinner("Thinking..."):
                 reply = post_query(api_base, q, st.session_state.session_id)
         except requests.RequestException as e:
-            reply = f"**Request failed:** {e}"
+            reply = format_api_error(e, api_base)
         st.session_state.messages = [
             *st.session_state.messages,
             {"role": "assistant", "content": reply},
