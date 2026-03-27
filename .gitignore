@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.Python
+.venv/
+venv/
+.env
+.env.*
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+
+# Streamlit / local secrets (never commit keys)
+.streamlit/secrets.toml

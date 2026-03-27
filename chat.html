@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Glow Chat</title>
+  <style>
+    :root {
+      --bg: #0b0f1a;
+      --panel: rgba(255, 255, 255, 0.06);
+      --text: rgba(255, 255, 255, 0.92);
+      --muted: rgba(255, 255, 255, 0.65);
+      --border: rgba(255, 255, 255, 0.14);
+      --shadow: 0 8px 30px rgba(0,0,0,0.35);
+      --accent: #7c5cff;
+      --accent2: #2dd4bf;
+      --danger: #fb7185;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      background: radial-gradient(1200px 800px at 20% 0%, rgba(124, 92, 255, 0.35), transparent 55%),
+                  radial-gradient(1000px 700px at 90% 10%, rgba(45, 212, 191, 0.25), transparent 50%),
+                  var(--bg);
+      color: var(--text);
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      backdrop-filter: blur(10px);
+      background: linear-gradient(to bottom, rgba(11, 15, 26, 0.85), rgba(11, 15, 26, 0.65));
+      border-bottom: 1px solid var(--border);
+    }
+    .header-inner {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 14px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;
+      gap: 12px;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; min-width: 240px; }
+    .logo {
+      width: 34px; height: 34px; border-radius: 10px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      box-shadow: var(--shadow);
+    }
+    .brand h1 { font-size: 16px; margin: 0; font-weight: 700; letter-spacing: 0.2px; }
+    .brand p { margin: 0; color: var(--muted); font-size: 12px; }
+    main { max-width: 980px; margin: 0 auto; padding: 18px 18px 28px; }
+    .chat-surface {
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.04);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+    .messages {
+      padding: 18px 18px 8px;
+      height: calc(100vh - 210px);
+      overflow: auto;
+    }
+    .row { display: flex; margin-bottom: 14px; }
+    .row.user { justify-content: flex-end; }
+    .row.assistant { justify-content: flex-start; }
+    .bubble {
+      max-width: 78%;
+      padding: 12px 14px;
+      border-radius: 16px;
+      border: 1px solid rgba(255,255,255,0.12);
+      background: rgba(255,255,255,0.04);
+      white-space: pre-wrap;
+      line-height: 1.4;
+      font-size: 14px;
+    }
+    .row.user .bubble {
+      background: linear-gradient(135deg, rgba(124, 92, 255, 0.22), rgba(45, 212, 191, 0.10));
+      border-color: rgba(124, 92, 255, 0.35);
+    }
+    .composer {
+      padding: 14px 14px 18px;
+      border-top: 1px solid var(--border);
+      background: rgba(0,0,0,0.10);
+    }
+    .composer-inner { display: flex; flex-direction: column; gap: 10px; }
+    .smallbar { display:flex; justify-content:space-between; align-items:center; gap: 12px; color: var(--muted); font-size: 12px; }
+    .hint { display:flex; align-items:center; gap: 8px; }
+    .pill {
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.03);
+    }
+    .input-area { display:flex; gap: 10px; align-items:flex-end; }
+    textarea {
+      width: 100%;
+      min-height: 46px;
+      max-height: 160px;
+      resize: none;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.03);
+      color: var(--text);
+      padding: 12px 12px;
+      outline: none;
+      font-size: 14px;
+      line-height: 1.4;
+    }
+    textarea:focus {
+      border-color: rgba(124, 92, 255, 0.55);
+      box-shadow: 0 0 0 3px rgba(124, 92, 255, 0.16);
+    }
+    button {
+      border: 1px solid rgba(255,255,255,0.16);
+      background: rgba(255,255,255,0.06);
+      color: var(--text);
+      border-radius: 14px;
+      padding: 11px 14px;
+      cursor: pointer;
+      transition: transform 0.1s ease, background 0.1s ease, border-color 0.1s ease, opacity 0.1s ease;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    button:hover { transform: translateY(-1px); background: rgba(255,255,255,0.10); border-color: rgba(255,255,255,0.24); }
+    button.primary {
+      border-color: rgba(124, 92, 255, 0.55);
+      background: linear-gradient(135deg, rgba(124, 92, 255, 0.85), rgba(45, 212, 191, 0.55));
+    }
+    button:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
+    .error { color: var(--danger); font-size: 13px; margin-top: 6px; display:none; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <div class="brand">
+        <div class="logo" aria-hidden="true"></div>
+        <div>
+          <h1>Glow Chat</h1>
+          <p>Ask about stocks, valuations, and news</p>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div class="chat-surface">
+      <div id="messages" class="messages" aria-label="Chat messages"></div>
+      <div class="composer">
+        <div class="composer-inner">
+          <div class="smallbar">
+            <div class="hint">
+              <span class="pill">Tip</span>
+              <span>Try: “Compare NVDA vs AMD”</span>
+            </div>
+            <div id="status" class="hint" aria-live="polite"></div>
+          </div>
+
+          <div class="input-area">
+            <textarea id="input" placeholder="Type your question..." autocomplete="off"></textarea>
+            <button id="sendBtn" class="primary" type="button">Send</button>
+          </div>
+
+          <div id="error" class="error" role="alert"></div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    const API_BASE_URL = (localStorage.getItem("ENVY_API_BASE_URL") || "").trim();
+    function apiUrl(path) {
+      if (!API_BASE_URL) return path;
+      return API_BASE_URL.replace(/\/+$/, "") + path;
+    }
+
+    function uuid() {
+      return "xxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function(c) {
+        const r = Math.random() * 16 | 0;
+        const v = c === "x" ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+      });
+    }
+
+    const sessionKeyStorageName = "ENVY_SESSION_ID";
+    let sessionId = localStorage.getItem(sessionKeyStorageName);
+    if (!sessionId) {
+      sessionId = uuid();
+      localStorage.setItem(sessionKeyStorageName, sessionId);
+    }
+
+    const messagesEl = document.getElementById("messages");
+    const inputEl = document.getElementById("input");
+    const sendBtn = document.getElementById("sendBtn");
+    const statusEl = document.getElementById("status");
+    const errorEl = document.getElementById("error");
+
+    function appendMessage(role, text) {
+      const row = document.createElement("div");
+      row.className = "row " + role;
+
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      bubble.textContent = text;
+
+      row.appendChild(bubble);
+      messagesEl.appendChild(row);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function setError(msg) {
+      if (!msg) {
+        errorEl.style.display = "none";
+        errorEl.textContent = "";
+        return;
+      }
+      errorEl.style.display = "block";
+      errorEl.textContent = msg;
+    }
+
+    async function sendMessage() {
+      const q = (inputEl.value || "").trim();
+      if (!q) return;
+
+      setError(null);
+      inputEl.value = "";
+
+      appendMessage("user", q);
+      sendBtn.disabled = true;
+      statusEl.textContent = "Thinking...";
+
+      try {
+        const resp = await fetch(apiUrl("/query"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: q, session_id: sessionId }),
+        });
+
+        if (!resp.ok) {
+          const txt = await resp.text().catch(() => "");
+          throw new Error("Request failed: " + resp.status + (txt ? (" - " + txt) : ""));
+        }
+
+        const data = await resp.json();
+        const answer = data && typeof data.response === "string" ? data.response : "(No response)";
+        appendMessage("assistant", answer);
+      } catch (e) {
+        setError(e && e.message ? e.message : String(e));
+      } finally {
+        statusEl.textContent = "";
+        sendBtn.disabled = false;
+        inputEl.focus();
+      }
+    }
+
+    sendBtn.addEventListener("click", sendMessage);
+    inputEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+
+    appendMessage("assistant", "Ask me about stocks. Include a ticker like AAPL/MSFT, or a name like Apple/Microsoft. If you omit a ticker later, I’ll reuse your last one for this browser session.");
+  </script>
+</body>
+</html>
+
