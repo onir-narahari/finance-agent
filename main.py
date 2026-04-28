@@ -19,6 +19,11 @@ import requests
 API_KEY = "y0axaPDDB3bSmyfPBpLg45tj4ZJdMjgW"
 OPENAI_MODEL_DEFAULT = "gpt-4.1-mini"
 
+# User-intent taxonomy (primary + optional secondary). Do not add categories outside this set.
+ALLOWED_ANALYSIS_INTENTS = frozenset(
+    {"valuation", "risk", "growth", "comparison", "full_analysis"}
+)
+
 # Annual EPS, yearly average price (historical P/E), price history API range — max year; TTM uses last 4 quarters separately.
 MAX_HISTORICAL_YEAR = 2025
 
@@ -750,32 +755,150 @@ def call_openai(prompt: str, model: Optional[str] = None) -> str:
     return ai_text
 
 
-def _heuristic_intent(query: str) -> str:
+def _map_legacy_intent_to_primary_secondary(intent: str) -> tuple[str, list[str]]:
+    """Map older extraction intents onto the fixed five-category taxonomy."""
+    base = (intent or "").strip().lower()
+    if base == "valuation":
+        return ("valuation", [])
+    if base == "risk":
+        return ("risk", [])
+    if base == "financials":
+        return ("growth", [])
+    if base in ("recommendation", "general", "news"):
+        return ("full_analysis", [])
+    return ("full_analysis", [])
+
+
+def _heuristic_primary_secondary(query: str) -> tuple[str, list[str]]:
+    """Fallback classification when the model is unavailable."""
     q = (query or "").lower()
-    if any(k in q for k in ("news", "headline", "recent news", "what's going on", "what is going on")):
-        return "news"
-    if any(
+    secondary: list[str] = []
+
+    if re.search(r"\b(vs|versus|compare|comparison|better than|which one)\b", q):
+        return ("comparison", [])
+
+    risk_hit = any(k in q for k in ("risk", "downside", "volatility", "threat", "concern", "danger"))
+    val_hit = any(
         k in q
+        for k in ("value", "valuation", "intrinsic", "undervalued", "overvalued", "cheap", "expensive")
+    )
+    growth_hit = any(
+        k in q
+        for k in (
+            "growth",
+            "growing",
+            "revenue",
+            "eps",
+            "cagr",
+            "earnings growth",
+            "top line",
+            "long-term",
+        )
+    )
+    full_hit = any(
+        k in q
+        for k in (
+            "recommend",
+            "buy",
+            "sell",
+            "hold",
+            "should i",
+            "good investment",
+            "worth buying",
+            "analyze",
+            "analysis",
+            "overview",
+            "full picture",
+        )
+    )
+
+    if risk_hit and val_hit and not growth_hit:
+        return ("risk", ["valuation"])
+    if risk_hit and growth_hit:
+        return ("risk", ["growth"])
+    if val_hit and growth_hit:
+        return ("valuation", ["growth"])
+    if risk_hit:
+        return ("risk", [])
+    if val_hit:
+        return ("valuation", [])
+    if growth_hit:
+        return ("growth", [])
+    if full_hit:
+        extra: list[str] = []
+        if val_hit:
+            extra.append("valuation")
+        if growth_hit:
+            extra.append("growth")
+        return ("full_analysis", extra[:2])
+
+    return ("full_analysis", secondary)
+
+
+def _wants_news_only_route(query: str) -> bool:
+    """Headlines-only path: user wants news flow, not a fundamentals/valuation run."""
+    ql = (query or "").lower().strip()
+    if not ql:
+        return False
+    if not any(
+        k in ql
+        for k in (
+            "news",
+            "headline",
+            "headlines",
+            "what's going on",
+            "what is going on",
+            "happening with",
+            "latest on",
+        )
+    ):
+        return False
+    if any(
+        k in ql
+        for k in (
+            "valuation",
+            "intrinsic",
+            "undervalued",
+            "overvalued",
+            "p/e",
+            "peg",
+            "fundamental",
+            "margin",
+            "debt to equity",
+            "balance sheet",
+        )
+    ):
+        return False
+    return True
+
+
+def _wants_financials_only_route(query: str) -> bool:
+    """Structured metrics path without prioritizing news narrative."""
+    ql = (query or "").lower().strip()
+    if not ql:
+        return False
+    fin = any(
+        k in ql
         for k in (
             "financial",
             "financials",
             "income statement",
             "balance sheet",
             "cash flow",
-            "revenue",
-            "earnings",
-            "eps",
             "margin",
+            "roe",
+            "revenue",
+            "earnings per share",
+            "eps trend",
         )
-    ):
-        return "financials"
-    if any(k in q for k in ("risk", "downside", "volatility", "threat", "concern")):
-        return "risk"
-    if any(k in q for k in ("recommend", "buy", "sell", "hold", "should i")):
-        return "recommendation"
-    if any(k in q for k in ("value", "valuation", "intrinsic", "undervalued", "overvalued")):
-        return "valuation"
-    return "general"
+    )
+    if not fin:
+        return False
+    if _wants_news_only_route(query):
+        return False
+    if any(k in ql for k in ("news", "headline", "headlines")):
+        return False
+    return True
 
 
 def _heuristic_tickers(query: str) -> list[str]:
@@ -935,6 +1058,52 @@ def _parse_query_intent_structured(text: str) -> dict:
     return {"ticker": ticker, "intent": intent}
 
 
+def _normalize_secondary_list(raw: object, primary: str) -> list[str]:
+    out: list[str] = []
+    if raw is None:
+        return out
+    if isinstance(raw, str):
+        if raw.strip().upper() == "NONE" or not raw.strip():
+            return out
+        raw = [raw]
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        t = item.strip().lower()
+        if t in ALLOWED_ANALYSIS_INTENTS and t != primary and t not in out:
+            out.append(t)
+    return out
+
+
+def _finalize_primary_and_secondary(
+    primary: str,
+    secondary: list[str],
+    query: str,
+    tickers: list[str],
+) -> tuple[str, list[str]]:
+    """Clamp to allowed categories; comparison overrides when multiple names or compare-language appears."""
+    q = (query or "").lower()
+    p = (primary or "").strip().lower()
+    if p not in ALLOWED_ANALYSIS_INTENTS:
+        p = "full_analysis"
+
+    sec = _normalize_secondary_list(secondary, p)
+
+    comparison_signals = len(tickers) > 1 or bool(
+        re.search(r"\b(vs|versus|compare|comparison|better than|which one)\b", q)
+    )
+    if comparison_signals:
+        if p != "comparison" and p in ALLOWED_ANALYSIS_INTENTS - {"comparison"}:
+            if p not in sec:
+                sec.insert(0, p)
+        p = "comparison"
+        sec = [x for x in sec if x != "comparison"]
+
+    return p, sec
+
+
 def _parse_query_tickers_intent_structured(text: str) -> dict:
     """Parse model JSON for tickers/intent; return normalized fallback-safe payload."""
     raw = text.strip()
@@ -972,21 +1141,33 @@ def _parse_query_tickers_intent_structured(text: str) -> dict:
         if t and re.fullmatch(r"[A-Z]{1,5}([.-][A-Z]{1,2})?", t):
             tickers_out.append(t)
 
-    intent_raw = str(data.get("intent", "general")).strip().lower()
-    allowed = {"valuation", "risk", "recommendation", "general", "news", "financials"}
-    intent = intent_raw if intent_raw in allowed else "general"
+    primary_raw = data.get("primary")
+    if isinstance(primary_raw, str) and primary_raw.strip().lower() in ALLOWED_ANALYSIS_INTENTS:
+        primary = primary_raw.strip().lower()
+    else:
+        intent_raw = str(data.get("intent", "general")).strip().lower()
+        allowed_legacy = {"valuation", "risk", "recommendation", "general", "news", "financials"}
+        legacy = intent_raw if intent_raw in allowed_legacy else "general"
+        primary, _sec_from_legacy = _map_legacy_intent_to_primary_secondary(legacy)
 
-    return {"tickers": tickers_out, "intent": intent}
+    secondary = _normalize_secondary_list(data.get("secondary"), primary)
+
+    return {"tickers": tickers_out, "primary_intent": primary, "secondary_intents": secondary}
 
 
 def extract_tickers_and_intent(query: str, model: Optional[str] = None) -> dict:
     """
-    Extract a list of US tickers and intent from natural language.
-    Returns {"tickers": list[str], "intent": str}.
+    Extract tickers plus primary/secondary intent from natural language.
+    Returns {"tickers", "primary_intent", "secondary_intents", "intent"} (intent mirrors primary_intent).
     """
     text = (query or "").strip()
     if not text:
-        return {"tickers": [], "intent": "general"}
+        return {
+            "tickers": [],
+            "primary_intent": "full_analysis",
+            "secondary_intents": [],
+            "intent": "full_analysis",
+        }
 
     def _fallback_name_resolution() -> list[str]:
         segments = re.split(
@@ -1005,22 +1186,34 @@ def extract_tickers_and_intent(query: str, model: Optional[str] = None) -> dict:
         tickers = _heuristic_tickers(text)
         if not tickers:
             tickers = _fallback_name_resolution()
-        return {"tickers": tickers, "intent": _heuristic_intent(text)}
+        hp, hs = _heuristic_primary_secondary(text)
+        hp, hs = _finalize_primary_and_secondary(hp, hs, text, tickers)
+        return {
+            "tickers": tickers,
+            "primary_intent": hp,
+            "secondary_intents": hs,
+            "intent": hp,
+        }
 
     prompt = (
         "Extract structured fields from the user query.\n"
         "Return ONE JSON object only with exactly these keys:\n"
         '  "tickers": array of strings (US-style tickers uppercase) or empty array\n'
-        '  "intent": one of "news", "financials", "valuation", "risk", "recommendation", "general"\n'
+        '  "primary": one of "valuation" | "risk" | "growth" | "comparison" | "full_analysis"\n'
+        '  "secondary": array of zero or more of those same strings (must not include "primary"; omit duplicates)\n'
         "Rules:\n"
         "- If the user mentions multiple tickers (e.g. 'NVDA vs AMD', 'AAPL, MSFT and GOOGL'), include them all.\n"
         "- If the user mentions company/stock names, resolve them to the primary US ticker when possible.\n"
         "- tickers must be unique, uppercase, and 1-5 letters (optionally with '.' or '-' suffix).\n"
         "- If no tickers can be resolved, return an empty array.\n"
-        "- If intent is unclear, use general.\n"
-        '- If the user only wants headlines/news/what is happening, use intent "news".\n'
-        '- If they only want financial statements/metrics (no news), use "financials".\n'
-        '- If they focus on price/value/intrinsic/undervalued, use "valuation".\n'
+        '- "valuation": fair value, cheap/expensive, intrinsic value, undervalued/overvalued.\n'
+        '- "risk": downside, threats, volatility, balance sheet risk, macro risk to the name.\n'
+        '- "growth": revenue/EPS trajectory, reinvestment, long-term expansion (not a side-by-side compare).\n'
+        '- "comparison": compare two or more names, or ask which is better / vs / relative to peers.\n'
+        '- "full_analysis": broad or buy/hold/sell style asks when no narrower category fits best.\n'
+        "- If a second theme clearly applies, add it to secondary (e.g. long-term buy with valuation angle → "
+        'full_analysis primary, secondary ["valuation","growth"]).\n'
+        "- If there is no secondary theme, use an empty array.\n"
         "- No extra keys or prose.\n\n"
         f"User query: {text}"
     )
@@ -1029,59 +1222,55 @@ def extract_tickers_and_intent(query: str, model: Optional[str] = None) -> dict:
         raw_text = call_openai(prompt, model=model)
         parsed = _parse_query_tickers_intent_structured(raw_text)
     except Exception:
-        parsed = {"tickers": [], "intent": "general"}
+        parsed = {
+            "tickers": [],
+            "primary_intent": "full_analysis",
+            "secondary_intents": [],
+        }
 
     tickers = parsed.get("tickers") or []
     if not tickers:
         tickers = _heuristic_tickers(text) or _fallback_name_resolution()
 
-    intent = parsed.get("intent", "general")
-    if intent == "general":
-        intent = _heuristic_intent(text)
+    primary = str(parsed.get("primary_intent", "full_analysis")).strip().lower()
+    if primary not in ALLOWED_ANALYSIS_INTENTS:
+        primary = "full_analysis"
+    secondary = parsed.get("secondary_intents")
+    if not isinstance(secondary, list):
+        secondary = []
+    secondary = _normalize_secondary_list(secondary, primary)
+    if primary == "full_analysis" and not secondary:
+        hp, hs = _heuristic_primary_secondary(text)
+        if hp != "full_analysis" or hs:
+            primary, secondary = hp, hs
 
-    return {"tickers": tickers, "intent": intent}
+    primary, secondary = _finalize_primary_and_secondary(primary, secondary, text, tickers)
+
+    return {
+        "tickers": tickers,
+        "primary_intent": primary,
+        "secondary_intents": secondary,
+        "intent": primary,
+    }
 
 
 def extract_ticker_and_intent(query: str, model: Optional[str] = None) -> dict:
     """
-    Backwards-compatible: first ticker only (used by /analyze run_pipeline).
+    Backwards-compatible: first ticker plus intent (used by /analyze run_pipeline).
     """
     extracted = extract_tickers_and_intent(query, model=model)
     tickers = extracted.get("tickers") or []
     ticker = tickers[0] if tickers else None
-    return {"ticker": ticker, "intent": extracted.get("intent", "general")}
-
-
-def _normalize_query_intent(intent_raw: str, query: str, tickers: list[str]) -> str:
-    """
-    Normalize mixed intents into the app's high-level buckets:
-    news | financials | valuation | recommendation | risk | comparison | general_analysis
-    """
-    q = (query or "").lower()
-    base = (intent_raw or "").strip().lower()
-
-    comparison_hint = (
-        len(tickers) > 1
-        or bool(re.search(r"\b(vs|versus|compare|comparison|better than|which one)\b", q))
-    )
-    if comparison_hint:
-        return "comparison"
-
-    if base == "recommendation" or any(k in q for k in ("recommend", "buy", "sell", "hold", "should i")):
-        return "recommendation"
-
-    if base == "risk" or any(k in q for k in ("risk", "downside", "volatility", "threat", "concern", "safe")):
-        return "risk"
-
-    # Preserve narrow asks so we don't force the full five-pillar template every time.
-    if base == "news":
-        return "news"
-    if base == "financials":
-        return "financials"
-    if base == "valuation":
-        return "valuation"
-
-    return "general_analysis"
+    primary = str(extracted.get("primary_intent") or extracted.get("intent") or "full_analysis").strip().lower()
+    secondary = extracted.get("secondary_intents")
+    if not isinstance(secondary, list):
+        secondary = []
+    return {
+        "ticker": ticker,
+        "intent": primary,
+        "primary_intent": primary,
+        "secondary_intents": secondary,
+    }
 
 
 def _detect_follow_up_query(query: str, tickers: list[str], conversation_state: Optional[dict[str, object]] = None) -> bool:
@@ -1128,150 +1317,236 @@ def understand_query(
     model: Optional[str] = None,
 ) -> dict:
     """
-    Process user input and extract:
-    - intent: news | financials | valuation | recommendation | risk | comparison | general_analysis
-    - tickers: list[str]
-    - is_follow_up: bool
+    Process user input and extract primary/secondary intent (fixed taxonomy), tickers, follow-up flag.
     """
     extracted = extract_tickers_and_intent(query, model=model)
     tickers = [str(t).strip().upper() for t in (extracted.get("tickers") or []) if str(t).strip()]
-    raw_intent = str(extracted.get("intent", "general")).strip().lower()
-    intent = _normalize_query_intent(raw_intent, query, tickers)
+    primary = str(extracted.get("primary_intent") or extracted.get("intent") or "full_analysis").strip().lower()
+    if primary not in ALLOWED_ANALYSIS_INTENTS:
+        primary = "full_analysis"
+    secondary = extracted.get("secondary_intents")
+    if not isinstance(secondary, list):
+        secondary = []
+    secondary = [str(s).strip().lower() for s in secondary if str(s).strip().lower() in ALLOWED_ANALYSIS_INTENTS]
     is_follow_up = _detect_follow_up_query(query, tickers, conversation_state=conversation_state)
 
     return {
-        "intent": intent,
-        "raw_intent": raw_intent,
+        "intent": primary,
+        "primary_intent": primary,
+        "secondary_intents": secondary,
         "tickers": tickers,
         "is_follow_up": is_follow_up,
     }
 
 
+def _format_secondary_intent_line(secondary: Optional[list[str]]) -> str:
+    if not secondary:
+        return "NONE"
+    return ", ".join(secondary)
+
+
+def format_primary_secondary_lines(primary: str, secondary: Optional[list[str]]) -> str:
+    """Human-readable intent (matches the required Primary / Secondary labeling)."""
+    p = (primary or "full_analysis").strip().lower()
+    return f"Primary: {p}\nSecondary: {_format_secondary_intent_line(secondary)}"
+
+
+def build_disciplined_value_investor_prompt(
+    primary_intent: str,
+    secondary_intents: Optional[list[str]],
+    user_question: str,
+    stock_data_block: str,
+    *,
+    step2_extra: str = "",
+) -> str:
+    """Shared analyst instructions + intent slots + user question + data block."""
+    sec_line = _format_secondary_intent_line(secondary_intents)
+    step2 = (
+        "Step 2: Anchor in the data (metrics first)\n\n"
+        "The Stock Data block is the source of truth.\n"
+        "- From JSON: pair claims with concrete field names and values (e.g. undervaluation_percent: -12.3; peg_ratio: 1.4). "
+        "Prefer digits and ratios over adjectives.\n"
+        "- Lead with the numbers that matter for the user's intent—multiples, growth rates, margins, leverage, returns, "
+        "yields—only where those fields exist.\n"
+        "- When two metrics belong together (e.g. PEG vs EPS growth), state both figures in the same sentence or breath.\n"
+        "- If a needed figure is missing, say so in one short clause; do not invent or estimate.\n\n"
+        "When present, map metrics roughly as:\n"
+        "- Price vs intrinsic / undervaluation → valuation\n"
+        "- EPS trend, PEG → growth\n"
+        "- Margins, ROE → quality\n"
+        "- Debt, FCF, leverage → risk\n\n"
+        "Do NOT:\n"
+        "- add outside knowledge\n"
+        "- use filler or generic praise not tied to a number\n"
+        "- assume facts not in the data\n"
+    )
+    if step2_extra.strip():
+        step2 = step2.rstrip() + "\n\n" + step2_extra.strip() + "\n"
+
+    return (
+        "You are a disciplined value-investing analyst.\n\n"
+        "Lead with the numbers from the data; keep interpretation short and attached to those figures. "
+        "Sound human—clear, natural sentences—but avoid throat-clearing and padding that isn't tied to a metric or quoted fact.\n\n"
+        "---\n\n"
+        "Step 1: Understand intent\n\n"
+        "You are given:\n"
+        "- Primary intent\n"
+        "- Secondary intent(s) (optional)\n\n"
+        "Follow this strictly:\n\n"
+        "- If Primary = full_analysis → cover valuation + growth + profitability + risk using figures from the data\n"
+        "- If Primary = valuation → focus mainly on valuation metrics\n"
+        "- If Primary = risk → focus mainly on risk metrics and downside signals in the data\n"
+        "- If Primary = growth → focus mainly on growth and trajectory metrics\n"
+        "- If Primary = comparison → compare names on the same metrics side by side with numbers\n\n"
+        "Secondary intent(s):\n"
+        "- Weave in briefly as supporting stats only; do not let them crowd out the primary metrics\n\n"
+        "---\n\n"
+        f"{step2}"
+        "---\n\n"
+        "Step 3: Voice — natural but number-led\n\n"
+        "- **Figure first**, then one tight clause on why it matters.\n"
+        "- Aim for high signal: most sentences should include an explicit number, %, ratio, or quoted fact from Stock Data.\n"
+        "- Cut filler: avoid setups like \"overall\", \"broadly\", \"it's interesting that\", \"in the current environment\" unless essential.\n"
+        "- Readability: short paragraphs; you may chain 2–3 related stats in one paragraph—no rigid section headers.\n"
+        "- Skip decorative adjectives (robust, strong, solid) unless immediately tied to a figure beside them.\n\n"
+        "---\n\n"
+        "Step 4: Scope\n\n"
+        "- Narrow question → only the metrics needed to answer it, plus minimal supporting figures.\n"
+        "- Broad question → walk valuation, growth, quality, and risk with **concrete figures** for each (still flowing prose, not labeled boxes).\n"
+        "- Comparison → same metric names across tickers where possible; judge with numbers, then a clear preference.\n\n"
+        "---\n\n"
+        "Step 5: Close\n\n"
+        "- End with a compact bottom line; when the data allow, include at least one quantitative hook in the last few sentences "
+        "(e.g. undervaluation %, PEG, leverage).\n"
+        "- No labels like \"Verdict:\"—but the stance (bullish / neutral / bearish) should be obvious.\n\n"
+        "---\n\n"
+        f"Primary Intent:\n{primary_intent}\n\n"
+        f"Secondary Intent:\n{sec_line}\n\n"
+        "---\n\n"
+        f"User Question:\n{user_question}\n\n"
+        "---\n\n"
+        f"Stock Data:\n{stock_data_block}"
+    )
+
+
 def answer_query_with_context(
-    query: str, analysis_json: dict, news_context: str, model: Optional[str] = None
+    query: str,
+    analysis_json: dict,
+    news_context: str,
+    model: Optional[str] = None,
+    primary_intent: str = "full_analysis",
+    secondary_intents: Optional[list[str]] = None,
 ) -> str:
     """
-    Answer a user question using only provided stock analysis JSON and news context.
+    Answer using only provided stock analysis JSON and news context (disciplined value-investor template).
     """
     payload_json = json.dumps(analysis_json, indent=2, default=str)
     news_text = news_context.strip() if isinstance(news_context, str) and news_context.strip() else "(none provided)"
-    prompt = (
-        "You are a stock analyst.\n\n"
-        "Here is the stock data:\n"
+    combined = (
+        "Structured financial snapshot (JSON):\n"
         f"{payload_json}\n\n"
-        "Here is recent news:\n"
-        f"{news_text}\n\n"
-        "User question:\n"
-        f"{query}\n\n"
-        "Use ONLY the data and news above. No outside knowledge. Plain language, no hype.\n\n"
-        "Completeness:\n"
-        "- If they ask for a broad analysis (analyze, review, overview), cover valuation, fundamentals, growth, risk, and news as relevant—use JSON numbers and headlines.\n"
-        "- If the question is narrow, answer that directly; do not force the same five labeled sections every time.\n\n"
-        "Format:\n"
-        "- Prefer short bullets starting with \"- \" (often about 4–6); paragraphs are OK if the question fits better.\n"
-        "- Each point should tie to concrete fields from the JSON or a news takeaway.\n"
-        "- If they ask buy/sell/hold, include Recommendation: buy | hold | sell with a brief data-backed reason.\n"
-        "- Do not end with a question or an invitation to ask more.\n"
+        "Recent news (headline summary):\n"
+        f"{news_text}"
+    )
+    step2_note = (
+        "Fundamentals drive the answer: cite JSON field names and values first. "
+        "Use news only as short reinforcement when it adds a dated fact or catalyst; do not let headlines replace the numbers."
+    )
+    prompt = build_disciplined_value_investor_prompt(
+        primary_intent,
+        secondary_intents,
+        query,
+        combined,
+        step2_extra=step2_note,
+    )
+    prompt += (
+        "\n\nRespond in plain prose only—dense on figures, light on filler. "
+        "Do not end with a question to the user."
     )
     return call_openai(prompt, model=model)
 
 
-def answer_news_only_query(query: str, news_context: str, model: Optional[str] = None) -> str:
+def answer_news_only_query(
+    query: str,
+    news_context: str,
+    model: Optional[str] = None,
+    primary_intent: str = "full_analysis",
+    secondary_intents: Optional[list[str]] = None,
+) -> str:
     news_text = news_context.strip() if isinstance(news_context, str) and news_context.strip() else "(none provided)"
-    prompt = (
-        "You are a helpful finance assistant.\n\n"
-        "Here is recent headline/source material:\n"
-        f"{news_text}\n\n"
-        "User question:\n"
-        f"{query}\n\n"
-        "Answer ONLY from the material above. Do not invent events or add valuation/fundamentals not in that text.\n"
-        "Write in a natural, conversational tone—like chat, not a fixed report template.\n"
-        "Use short paragraphs and/or bullets as fits; aim for similar depth to a handful of clear points.\n"
-        "Do not force section labels (e.g. Valuation / Fundamentals / Growth / Risk / News) unless the user asked for that structure.\n"
-        "If they only asked for news, stick to what the headlines imply and skip unrelated investment sections.\n"
-        "Do not end by asking the user a follow-up question."
+    step2_note = (
+        "Stock Data is headline/source text only—do not invent fundamentals. "
+        "Still be concrete: quote dates, percentages, or dollar amounts when they appear in the text; keep interpretation minimal."
+    )
+    prompt = build_disciplined_value_investor_prompt(
+        primary_intent,
+        secondary_intents,
+        query,
+        news_text,
+        step2_extra=step2_note,
+    )
+    prompt += (
+        "\n\nRespond in plain prose only—prioritize quoted facts and figures from the text. "
+        "Do not end with a question to the user."
     )
     return call_openai(prompt, model=model)
 
 
-def answer_financials_only_query(query: str, analysis_json: dict, model: Optional[str] = None) -> str:
+def answer_financials_only_query(
+    query: str,
+    analysis_json: dict,
+    model: Optional[str] = None,
+    primary_intent: str = "growth",
+    secondary_intents: Optional[list[str]] = None,
+) -> str:
     payload_json = json.dumps(analysis_json, indent=2, default=str)
-    prompt = (
-        "You are a stock analyst.\n\n"
-        "Here is the stock data:\n"
-        f"{payload_json}\n\n"
-        "User question:\n"
-        f"{query}\n\n"
-        "Answer ONLY using this JSON. No outside knowledge or news.\n"
-        "Use about **5** bullet lines with \"- \" and numbers from the data (4–6 if needed).\n"
-        "If they ask buy/sell/hold: include Recommendation: buy | hold | sell — reason from the data.\n"
-        "Do not end by asking the user a follow-up question."
+    step2_note = (
+        "JSON only—no separate news. Name each metric field you use and give its value; stack the most decision-relevant numbers."
+    )
+    prompt = build_disciplined_value_investor_prompt(
+        primary_intent,
+        secondary_intents,
+        query,
+        payload_json,
+        step2_extra=step2_note,
+    )
+    prompt += (
+        "\n\nRespond in plain prose only—metric-dense, minimal narrative padding. "
+        "Do not end with a question to the user."
     )
     return call_openai(prompt, model=model)
 
 
-def _parse_summary_structured(text: str) -> dict:
-    """Parse JSON from model output; tolerate markdown fences or trailing prose."""
-    raw = text.strip()
-    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw)
-    if fence:
-        raw = fence.group(1).strip()
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        start, end = raw.find("{"), raw.rfind("}")
-        if start != -1 and end > start:
-            try:
-                data = json.loads(raw[start : end + 1])
-            except json.JSONDecodeError:
-                data = None
-        else:
-            data = None
-
-    if not isinstance(data, dict):
-        return {
-            "explanation": text.strip(),
-            "recommendation": "hold",
-            "reasoning": "Could not parse JSON; raw model output is in explanation.",
-        }
-
-    explanation = str(data.get("explanation", "")).strip()
-    reasoning = str(data.get("reasoning", "")).strip()
-    rec_raw = str(data.get("recommendation", "hold")).strip().lower()
-
-    if rec_raw in ("buy", "hold", "sell"):
-        recommendation = rec_raw
-    elif "buy" in rec_raw:
-        recommendation = "buy"
-    elif "sell" in rec_raw:
-        recommendation = "sell"
-    else:
-        recommendation = "hold"
-
-    if not explanation:
-        explanation = "See reasoning for the value-investor view."
-    if not reasoning:
-        reasoning = "No separate reasoning field was provided."
-
-    return {
-        "explanation": explanation,
-        "recommendation": recommendation,
-        "reasoning": reasoning,
-    }
+def _infer_recommendation_from_narrative(text: str) -> str:
+    """Map bottom-line wording to buy/hold/sell for API consumers."""
+    tail = (text or "")[-1600:].lower()
+    if not tail.strip():
+        return "hold"
+    if re.search(r"\b(sell|bearish|avoid|short|overvalued|too rich)\b", tail) and not re.search(
+        r"\b(buy|bullish|undervalued)\b", tail[-500:]
+    ):
+        return "sell"
+    if re.search(r"\b(buy|bullish|undervalued|attractive)\b", tail) and not re.search(
+        r"\b(sell|bearish)\b", tail[-500:]
+    ):
+        return "buy"
+    if "hold" in tail or "neutral" in tail:
+        return "hold"
+    return "hold"
 
 
 def summary_agent(
     valuation_output: dict,
     news_context: str = "",
-    user_intent: str = "general",
+    primary_intent: str = "full_analysis",
+    secondary_intents: Optional[list[str]] = None,
+    user_question: str = "",
     model: Optional[str] = None,
 ) -> dict:
     """
-    Concise hedge-fund-style summary: strong buy/hold/sell plus tight explanation and reasoning.
+    Narrative answer using the disciplined value-investor template.
 
-    Returns a structured JSON-safe dict with fields:
-    { "explanation", "recommendation" ("buy"|"hold"|"sell"), "reasoning" }.
+    Returns { "explanation", "recommendation" ("buy"|"hold"|"sell"), "reasoning" }.
     """
     if not os.environ.get("OPENAI_API_KEY"):
         return {
@@ -1284,61 +1559,41 @@ def summary_agent(
         }
 
     payload_json = json.dumps(valuation_output, indent=2, default=str)
-    news_block = f"{news_context.strip()}\n\n" if isinstance(news_context, str) and news_context.strip() else ""
-    news_section = news_block if news_block else "(none provided)\n\n"
-    intent = str(user_intent or "general").strip().lower()
-    if intent not in {"valuation", "risk", "recommendation", "general"}:
-        intent = "general"
-    intent_guidance = {
-        "risk": (
-            "User intent is risk/downside analysis. "
-            "volatility signals, mention possible bad financial indicators, egative/cautionary headlines, and drawdown risks before upside."
-        ),
-        "valuation": (
-            "User intent is valuation. Prioritize intrinsic value vs current price, undervaluation_percent, "
-            "PEG, and quality-of-earnings signals from the provided data. Present data in a way that is easy to understand and follow."
-        ),
-        "recommendation": (
-            "User intent is actionable recommendation. Provide a clear buy/hold/sell call supported by "
-            "the strongest financial and news evidence."
-        ),
-        "general": (
-            "User intent is general analysis. Balance upside, downside, valuation, and news catalysts."
-        ),
-    }[intent]
-    prompt = (
-        'role: You are a senior hedge fund analyst writing a brief internal note for the investment committee. '
-        "Tone: factual and direct. Use short, plain sentences.\n\n"
-        "You must base your analysis on BOTH inputs below:\n"
-        "1) structured financial data (valuation JSON)\n"
-        "2) recent news context (headline summary)\n"
-        "Do not invent figures, events, or claims beyond these inputs. If news context is missing or thin, say so briefly and rely more on the financial data.\n\n"
-        f"intent focus: {intent}\n"
-        f"intent guidance: {intent_guidance}\n\n"
-        "recent news context:\n"
-        f"{news_section}"
-        "structured financial data (valuation JSON):\n"
+    news_text = news_context.strip() if isinstance(news_context, str) and news_context.strip() else "(none provided)"
+    combined = (
+        "Structured financial snapshot (JSON):\n"
         f"{payload_json}\n\n"
-        "output: Respond with ONE JSON object only (no prose outside JSON; optional ```json fence is OK). "
-        "Keys:\n"
-        '  "recommendation": string — exactly one of: "buy", "hold", or "sell". '
-        "State a STRONG conviction: pick one side; do not hedge with 'cautious buy' or similar.\n"
-        '  "explanation": string — 2 sentences maximum. Lead with the thesis: why this name, at this price, '
-        "on these metrics and this news flow. Explicitly reference at least two concrete financial fields by name "
-        '(e.g. "undervaluation_percent", "roe_percent", "peg_ratio", "debt_to_equity_percent") and one specific '
-        "news takeaway when available. No generic statements, no clichés, no disclaimers in the text.\n"
-        '  "reasoning": string — 2–3 short sentences OR up to 3 bullet lines (separate bullets with line breaks). '
-        "Tie the call to specific fields from the JSON and at least one relevant point from the news context when available "
-        "(e.g. sentiment, catalysts, risk signals). Mention field names directly and include the associated values where useful. "
-        "Cite numbers sparingly-one sharp fact per sentence.\n\n"
-        "Style rules: Tight, active voice. No filler ('it is worth noting', 'in conclusion'). "
-        "Use plain words; avoid adjectives like robust, strong, solid, impressive, exceptional, outstanding. "
-        "Avoid generic language like 'strong fundamentals' without citing the exact metric(s). "
-        "If the data conflict or are thin, say so in one clause and default recommendation to hold. "
-        "Educational / not personalized advice—keep that outside the JSON if needed, omit entirely."
+        "Recent news (headline summary):\n"
+        f"{news_text}"
+    )
+    p = str(primary_intent or "full_analysis").strip().lower()
+    if p not in ALLOWED_ANALYSIS_INTENTS:
+        p = "full_analysis"
+    sec = secondary_intents if isinstance(secondary_intents, list) else []
+    sec = [s for s in sec if isinstance(s, str) and s.strip().lower() in ALLOWED_ANALYSIS_INTENTS]
+
+    step2_note = (
+        "Open with the strongest 4–8 figures from the JSON (field name + value), then weave in news only if it adds a dated catalyst. "
+        "If news is thin, say so in one clause and stay on the numbers."
+    )
+    prompt = build_disciplined_value_investor_prompt(
+        p,
+        sec,
+        user_question or "(no question text; give a concise view of the name using the data)",
+        combined,
+        step2_extra=step2_note,
+    )
+    prompt += (
+        "\n\nRespond in plain prose only (no JSON)—figure-led, low fluff. "
+        "Do not end with a question to the user."
     )
     raw_text = call_openai(prompt, model=model)
-    return _parse_summary_structured(raw_text)
+    rec = _infer_recommendation_from_narrative(raw_text)
+    return {
+        "explanation": raw_text.strip(),
+        "recommendation": rec,
+        "reasoning": "",
+    }
 
 
 # ----------------------------
@@ -1356,9 +1611,17 @@ def run_pipeline(ticker: str, user_query: Optional[str] = None):
     extracted = (
         extract_ticker_and_intent(user_query, model=OPENAI_MODEL_DEFAULT)
         if isinstance(user_query, str) and user_query.strip()
-        else {"ticker": symbol, "intent": "general"}
+        else {
+            "ticker": symbol,
+            "intent": "full_analysis",
+            "primary_intent": "full_analysis",
+            "secondary_intents": [],
+        }
     )
-    intent = extracted.get("intent", "general")
+    primary = str(extracted.get("primary_intent") or extracted.get("intent") or "full_analysis").strip().lower()
+    secondary = extracted.get("secondary_intents")
+    if not isinstance(secondary, list):
+        secondary = []
     raw_data = data_agent(symbol)
     valuation = valuation_agent(raw_data)
     plot_data = build_plot_data(raw_data)
@@ -1368,19 +1631,34 @@ def run_pipeline(ticker: str, user_query: Optional[str] = None):
     if valuation is None:
         return None
 
-    summary = summary_agent(valuation, news_context=news_context, user_intent=intent)
+    summary = summary_agent(
+        valuation,
+        news_context=news_context,
+        primary_intent=primary,
+        secondary_intents=secondary,
+        user_question=user_query or "",
+        model=OPENAI_MODEL_DEFAULT,
+    )
 
     return {
         "ticker": symbol,
         "analysis": valuation,
         "plot": plot_data,
-        "intent": intent,
+        "intent": primary,
+        "primary_intent": primary,
+        "secondary_intents": secondary,
+        "intent_lines": format_primary_secondary_lines(primary, secondary),
         "news_context": news_context,
         "summary": summary,
     }
 
 
-def build_multi_ticker_context(tickers: list[str], query: str, intent: str = "comparison") -> dict:
+def build_multi_ticker_context(
+    tickers: list[str],
+    query: str,
+    intent: str = "comparison",
+    secondary_intents: Optional[list[str]] = None,
+) -> dict:
     """
     Run the pipeline per ticker and return a structured comparison-ready payload.
     This object is reusable for logging, debugging, or LLM prompting.
@@ -1423,9 +1701,12 @@ def build_multi_ticker_context(tickers: list[str], query: str, intent: str = "co
         )
 
     comparison_requested = str(intent or "").strip().lower() == "comparison"
+    sec = secondary_intents if isinstance(secondary_intents, list) else []
     return {
         "query": query,
         "intent": intent,
+        "primary_intent": str(intent or "").strip().lower(),
+        "secondary_intents": sec,
         "comparison_requested": comparison_requested,
         "requested_tickers": normalized,
         "analyzed_tickers": [s["ticker"] for s in stocks],
@@ -1435,15 +1716,22 @@ def build_multi_ticker_context(tickers: list[str], query: str, intent: str = "co
 
 
 def build_multi_ticker_llm_input(context: dict[str, object]) -> str:
-    """Prepare a compact, structured prompt payload for multi-ticker LLM comparisons."""
+    """Multi-ticker comparison prompt using the disciplined value-investor template."""
     query = str(context.get("query", "")).strip()
-    intent = str(context.get("intent", "comparison")).strip().lower()
+    primary = str(context.get("primary_intent") or context.get("intent", "comparison")).strip().lower()
+    if primary not in ALLOWED_ANALYSIS_INTENTS:
+        primary = "comparison"
+    secondary = context.get("secondary_intents")
+    if not isinstance(secondary, list):
+        secondary = []
+    secondary = [s for s in secondary if isinstance(s, str) and s.strip().lower() in ALLOWED_ANALYSIS_INTENTS]
     stocks = context.get("stocks")
     if not isinstance(stocks, list):
         stocks = []
 
     payload = {
-        "intent": intent,
+        "primary_intent": primary,
+        "secondary_intents": secondary,
         "comparison_requested": bool(context.get("comparison_requested")),
         "requested_tickers": context.get("requested_tickers", []),
         "analyzed_tickers": context.get("analyzed_tickers", []),
@@ -1462,20 +1750,21 @@ def build_multi_ticker_llm_input(context: dict[str, object]) -> str:
             }
         )
 
+    block = json.dumps(payload, indent=2, default=str)
+    step2_note = (
+        "Multiple tickers in JSON: line up the same ratios and growth stats across names with actual values side by side; "
+        "pick a winner using those numbers, not generalities."
+    )
+    prompt = build_disciplined_value_investor_prompt(
+        primary,
+        secondary,
+        query,
+        block,
+        step2_extra=step2_note,
+    )
     return (
-        "You are a hedge fund analyst. Be clear and scannable.\n\n"
-        f"User query:\n{query}\n\n"
-        "Use ONLY the structured input below. No outside knowledge.\n"
-        "For each ticker: provide valuation/fundamentals/growth/risk/news.\n"
-        "Then provide a cross-stock comparison and ranked recommendation.\n\n"
-        "Structured multi-stock input (JSON):\n"
-        f"{json.dumps(payload, indent=2, default=str)}\n\n"
-        "Output plain text only.\n"
-        "Format:\n"
-        "- One section per stock: 'TICKER:' then 4-6 bullets\n"
-        "- Comparison section: ~4 bullets\n"
-        "- Recommendation section: ~3 bullets with ranking and buy/hold/sell per ticker\n"
-        "- No markdown tables, no JSON, no follow-up questions."
+        prompt
+        + "\n\nRespond in plain prose only—comparison by metrics first. Do not end with a question to the user."
     )
 
 
@@ -1486,9 +1775,13 @@ def run_multi_stock_pipeline(tickers: list[str], query: str) -> str:
     - Combine into structured comparison context
     - Build LLM-ready comparison prompt
     """
-    extracted = extract_tickers_and_intent(query, model=OPENAI_MODEL_DEFAULT)
-    intent = _normalize_query_intent(str(extracted.get("intent", "general")).strip().lower(), query, tickers)
-    if intent == "news":
+    u = understand_query(query, conversation_state=None, model=OPENAI_MODEL_DEFAULT)
+    primary = str(u.get("primary_intent") or u.get("intent") or "full_analysis").strip().lower()
+    secondary = u.get("secondary_intents")
+    if not isinstance(secondary, list):
+        secondary = []
+
+    if _wants_news_only_route(query) and primary != "comparison":
         news_sections: list[str] = []
         for sym in tickers:
             sym_u = (sym or "").strip().upper()
@@ -1502,9 +1795,20 @@ def run_multi_stock_pipeline(tickers: list[str], query: str) -> str:
                 news_sections.append(nc)
         if not news_sections:
             raise HTTPException(status_code=400, detail="No tickers for news request.")
-        return answer_news_only_query(query, "\n\n".join(news_sections), model=OPENAI_MODEL_DEFAULT)
+        return answer_news_only_query(
+            query,
+            "\n\n".join(news_sections),
+            model=OPENAI_MODEL_DEFAULT,
+            primary_intent=primary,
+            secondary_intents=secondary,
+        )
 
-    context = build_multi_ticker_context(tickers, query=query, intent="comparison")
+    context = build_multi_ticker_context(
+        tickers,
+        query=query,
+        intent=primary,
+        secondary_intents=secondary,
+    )
     results = context.get("stocks") if isinstance(context.get("stocks"), list) else []
     if not results:
         raise HTTPException(status_code=404, detail="No valuation result for any requested ticker")
@@ -1516,6 +1820,8 @@ def run_multi_stock_pipeline(tickers: list[str], query: str) -> str:
             single.get("analysis", {}),  # type: ignore[arg-type]
             str(single.get("news_context", "")),
             model=OPENAI_MODEL_DEFAULT,
+            primary_intent=primary,
+            secondary_intents=secondary,
         )
 
     prompt = build_multi_ticker_llm_input(context)
@@ -1524,119 +1830,54 @@ def run_multi_stock_pipeline(tickers: list[str], query: str) -> str:
 
 def build_response_generation_prompt(structured_input: dict[str, object]) -> str:
     """
-    Build a controlled LLM prompt from structured inputs:
-    - intent
-    - ticker list
-    - per-ticker analysis/news blocks
+    Build the disciplined value-investor prompt from structured pipeline outputs.
     """
     query = str(structured_input.get("query", "")).strip()
-    intent = str(structured_input.get("intent", "general_analysis")).strip().lower()
-    tickers = structured_input.get("tickers", [])
+    primary = str(
+        structured_input.get("primary_intent") or structured_input.get("intent") or "full_analysis"
+    ).strip().lower()
+    if primary not in ALLOWED_ANALYSIS_INTENTS:
+        primary = "full_analysis"
+    secondary = structured_input.get("secondary_intents")
+    if not isinstance(secondary, list):
+        secondary = []
+    secondary = [s for s in secondary if isinstance(s, str) and s.strip().lower() in ALLOWED_ANALYSIS_INTENTS]
     stocks = structured_input.get("stocks", [])
-
-    if not isinstance(tickers, list):
-        tickers = []
     if not isinstance(stocks, list):
         stocks = []
 
-    tone_rules = {
-        "recommendation": (
-            "Tone: decisive and direct. Give a clear buy/hold/sell stance backed by data."
-        ),
-        "risk": (
-            "Tone: downside-first. Lead with risks, failure modes, and uncertainty before upside."
-        ),
-        "comparison": (
-            "Tone: side-by-side reasoning. Contrast names on the same metrics and highlight trade-offs."
-        ),
-        "news": (
-            "Tone: conversational; summarize only what the news context supports."
-        ),
-        "financials": (
-            "Tone: precise; cite numbers from the JSON. No news narrative unless asked."
-        ),
-        "valuation": (
-            "Tone: focus on price vs value and multiples; avoid repeating unrelated pillars."
-        ),
-        "general_analysis": (
-            "Tone: concise analyst brief. Match the scope of the question—do not pad with every pillar when they asked one thing."
-        ),
-    }
-    tone = tone_rules.get(intent, tone_rules["general_analysis"])
-
-    style_block = (
-        "Rules:\n"
-        "- Use ONLY the provided structured data and news context.\n"
-        "- Be concise and confident; no hedging filler.\n"
-        "- Ground every claim in fields from the input.\n"
-        "- No outside facts, no made-up numbers.\n"
-        "- No long paragraphs; use short bullet points.\n"
-    )
-
-    if intent == "comparison" or len(stocks) > 1:
-        format_block = (
-            "Output format:\n"
-            "- For each ticker, write 'TICKER:' then 3-5 bullets.\n"
-            "- Add 'Comparison' section with ~4 side-by-side bullets.\n"
-            "- Add 'Recommendation' section with ranking and buy/hold/sell per ticker.\n"
-            "- Keep the full answer compact and scannable.\n"
-        )
-    elif intent == "risk":
-        format_block = (
-            "Output format:\n"
-            "- About 5 bullets focused on downside risks first.\n"
-            "- Include one bullet for potential upside only after risk summary.\n"
-            "- End with one clear risk-oriented stance.\n"
-        )
-    elif intent == "recommendation":
-        format_block = (
-            "Output format:\n"
-            "- Start with 'Recommendation: buy|hold|sell' in first bullet.\n"
-            "- Then 4-5 bullets with strongest supporting evidence.\n"
-            "- Keep language decisive, concrete, and data-backed.\n"
-        )
-    elif intent == "news":
-        format_block = (
-            "Output format:\n"
-            "- Summarize recent news only from the provided news_context fields.\n"
-            "- Natural paragraphs or bullets; no mandatory valuation/fundamentals sections.\n"
-        )
-    elif intent == "financials":
-        format_block = (
-            "Output format:\n"
-            "- Answer from fundamentals/metrics in the JSON only (margins, ROE, debt, growth, EPS, etc.).\n"
-            "- About 4–6 bullets with concrete numbers; omit news unless the user asked for it.\n"
-        )
-    elif intent == "valuation":
-        format_block = (
-            "Output format:\n"
-            "- Focus on intrinsic vs price, undervaluation, and key multiples (PEG, P/S, P/B as relevant).\n"
-            "- About 4–6 bullets; do not force a full tour of unrelated topics.\n"
-        )
-    else:
-        format_block = (
-            "Output format:\n"
-            "- Match the user's question: narrow question → narrow answer.\n"
-            "- For broad asks (analyze, overview, full picture, review the name), use about 5–6 bullets and cover valuation, "
-            "fundamentals, growth, risk, and news as relevant.\n"
-            "- Avoid sounding like the same five labeled sections every time; vary structure when it still reads clearly.\n"
-        )
-
     payload = {
-        "intent": intent,
-        "tickers": tickers,
-        "stocks": stocks,
+        "primary_intent": primary,
+        "secondary_intents": secondary,
+        "stocks": [],
     }
+    for stock in stocks:
+        if not isinstance(stock, dict):
+            continue
+        payload["stocks"].append(
+            {
+                "ticker": stock.get("ticker"),
+                "analysis": stock.get("analysis", {}),
+                "news_context": stock.get("news_context", ""),
+            }
+        )
 
+    block = json.dumps(payload, indent=2, default=str)
+    step2_extra = (
+        "Multiple tickers: for each name, lead with its key JSON figures before contrasting; align on the same metric names when both have them."
+        if len(payload["stocks"]) > 1
+        else "Single ticker: stack the highest-signal metrics from the JSON first; use news only as short backup for catalysts."
+    )
+    prompt = build_disciplined_value_investor_prompt(
+        primary,
+        secondary,
+        query,
+        block,
+        step2_extra=step2_extra,
+    )
     return (
-        "You are a senior equity analyst.\n"
-        f"{tone}\n\n"
-        f"User query:\n{query}\n\n"
-        f"{style_block}\n"
-        f"{format_block}\n"
-        "Structured input JSON:\n"
-        f"{json.dumps(payload, indent=2, default=str)}\n\n"
-        "Respond in plain text only."
+        prompt
+        + "\n\nRespond in plain prose only—numbers forward, scannable. Do not end with a question to the user."
     )
 
 
@@ -1673,11 +1914,17 @@ def orchestrate_query_response(
     if not text:
         return {
             "response": "Please share a stock question so I can analyze it.",
-            "intent": "general_analysis",
+            "intent": "full_analysis",
             "tickers": [],
             "is_follow_up": False,
             "context": {"has_ticker": False},
-            "structured_input": {"intent": "general_analysis", "tickers": [], "stocks": []},
+            "structured_input": {
+                "intent": "full_analysis",
+                "primary_intent": "full_analysis",
+                "secondary_intents": [],
+                "tickers": [],
+                "stocks": [],
+            },
         }
 
     add_conversation_message(session_state, "user", text)
@@ -1695,7 +1942,15 @@ def orchestrate_query_response(
 
     context = resolve_query_context(extracted_tickers, session_state)
     tickers = context.get("tickers", []) if isinstance(context.get("tickers"), list) else []
-    intent = str(understood.get("intent", "general_analysis")).strip().lower()
+    intent = str(understood.get("intent", "full_analysis")).strip().lower()
+    secondary_intents = understood.get("secondary_intents")
+    if not isinstance(secondary_intents, list):
+        secondary_intents = []
+    secondary_intents = [
+        str(s).strip().lower()
+        for s in secondary_intents
+        if isinstance(s, str) and str(s).strip().lower() in ALLOWED_ANALYSIS_INTENTS
+    ]
 
     # Support follow-up comparison: "compare it with MSFT"
     if (
@@ -1721,7 +1976,13 @@ def orchestrate_query_response(
             "tickers": [],
             "is_follow_up": bool(understood.get("is_follow_up")),
             "context": context,
-            "structured_input": {"intent": intent, "tickers": [], "stocks": []},
+            "structured_input": {
+                "intent": intent,
+                "primary_intent": intent,
+                "secondary_intents": secondary_intents,
+                "tickers": [],
+                "stocks": [],
+            },
         }
 
     if intent == "comparison" and len(tickers) < 2:
@@ -1736,10 +1997,16 @@ def orchestrate_query_response(
             "tickers": tickers,
             "is_follow_up": bool(understood.get("is_follow_up")),
             "context": context,
-            "structured_input": {"intent": intent, "tickers": tickers, "stocks": []},
+            "structured_input": {
+                "intent": intent,
+                "primary_intent": intent,
+                "secondary_intents": secondary_intents,
+                "tickers": tickers,
+                "stocks": [],
+            },
         }
 
-    if intent == "news":
+    if _wants_news_only_route(text) and intent != "comparison":
         stock_rows: list[dict[str, object]] = []
         news_sections: list[str] = []
         for sym in tickers:
@@ -1751,10 +2018,19 @@ def orchestrate_query_response(
             else:
                 news_sections.append(nc)
         combined_news = "\n\n".join(news_sections)
-        response_text = answer_news_only_query(text, combined_news, model=model or OPENAI_MODEL_DEFAULT)
+        response_text = answer_news_only_query(
+            text,
+            combined_news,
+            model=model or OPENAI_MODEL_DEFAULT,
+            primary_intent=intent,
+            secondary_intents=secondary_intents,
+        )
         structured_input: dict[str, object] = {
             "query": text,
             "intent": intent,
+            "primary_intent": intent,
+            "secondary_intents": secondary_intents,
+            "intent_lines": format_primary_secondary_lines(intent, secondary_intents),
             "tickers": tickers,
             "stocks": stock_rows,
             "requested_tickers": tickers,
@@ -1774,12 +2050,20 @@ def orchestrate_query_response(
             "structured_input": structured_input,
         }
 
-    multi_context = build_multi_ticker_context(tickers, query=text, intent=intent)
+    multi_context = build_multi_ticker_context(
+        tickers,
+        query=text,
+        intent=intent,
+        secondary_intents=secondary_intents,
+    )
     stocks = multi_context.get("stocks", []) if isinstance(multi_context.get("stocks"), list) else []
 
     structured_input = {
         "query": text,
         "intent": intent,
+        "primary_intent": intent,
+        "secondary_intents": secondary_intents,
+        "intent_lines": format_primary_secondary_lines(intent, secondary_intents),
         "tickers": tickers,
         "stocks": stocks,
         "requested_tickers": multi_context.get("requested_tickers", []),
@@ -1788,11 +2072,15 @@ def orchestrate_query_response(
         "is_follow_up": bool(understood.get("is_follow_up")),
     }
 
-    if intent == "financials" and len(stocks) == 1:
+    if _wants_financials_only_route(text) and len(stocks) == 1 and intent != "comparison":
         s0 = stocks[0]
         if isinstance(s0, dict):
             response_text = answer_financials_only_query(
-                text, s0.get("analysis", {}), model=model or OPENAI_MODEL_DEFAULT
+                text,
+                s0.get("analysis", {}),
+                model=model or OPENAI_MODEL_DEFAULT,
+                primary_intent=intent,
+                secondary_intents=secondary_intents,
             )
         else:
             response_text = generate_response_from_structured_input(
